@@ -1,0 +1,12 @@
+[package]
+name = "clickhouse-arrow-udf-example"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+arrow-udf = "0.8"
+arrow-array = { version = "56", features = ["ffi"] }
+arrow-schema = { version = "56", features = ["ffi"] }

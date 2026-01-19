@@ -34,6 +34,7 @@ int mainEntryClickHouseKeeperConverter(int argc, char ** argv);
 int mainEntryClickHouseKeeperClient(int argc, char ** argv);
 #endif
 
+#if !defined(CLICKHOUSE_KEEPER_LIB)
 namespace
 {
 
@@ -64,7 +65,6 @@ int printHelp(int, char **)
 }
 
 }
-
 
 static bool isClickhouseApp(std::string_view app_suffix, std::vector<char *> & argv)
 {
@@ -221,3 +221,4 @@ int main(int argc_, char ** argv_)
 
     return exit_code;
 }
+#endif

@@ -16,6 +16,7 @@ set (CLICKHOUSE_KEEPER_LINK
 )
 
 clickhouse_program_add(keeper)
+target_compile_definitions(clickhouse-keeper-lib PRIVATE CLICKHOUSE_KEEPER_LIB)
 
 install(FILES keeper_config.xml DESTINATION "${CLICKHOUSE_ETC_DIR}/clickhouse-keeper" COMPONENT clickhouse-keeper)
 

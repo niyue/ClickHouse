@@ -66,6 +66,7 @@
 #include <Interpreters/Cache/QueryResultCache.h>
 #include <Interpreters/Cache/ReverseLookupCache.h>
 #include <Interpreters/ContextTimeSeriesTagsCollector.h>
+#include <Interpreters/ExtensionManager.h>
 #include <Interpreters/SessionTracker.h>
 #include <Core/ServerSettings.h>
 #include <Interpreters/PreparedSets.h>
@@ -479,6 +480,9 @@ struct ContextSharedPart : boost::noncopyable
     mutable std::unique_ptr<ExternalUserDefinedExecutableFunctionsLoader> external_user_defined_executable_functions_loader TSA_GUARDED_BY(external_user_defined_executable_functions_mutex);
     ExternalLoaderXMLConfigRepository * user_defined_executable_functions_config_repository TSA_GUARDED_BY(external_user_defined_executable_functions_mutex) = nullptr;
     scope_guard user_defined_executable_functions_xmls TSA_GUARDED_BY(external_user_defined_executable_functions_mutex);
+
+    mutable std::mutex extension_manager_mutex;
+    mutable std::unique_ptr<ExtensionManager> extension_manager TSA_GUARDED_BY(extension_manager_mutex);
 
     mutable OnceFlag user_defined_sql_objects_storage_initialized;
     mutable std::unique_ptr<IUserDefinedSQLObjectsStorage> user_defined_sql_objects_storage;
@@ -3447,6 +3451,15 @@ void Context::loadOrReloadUserDefinedExecutableFunctions(const Poco::Util::Abstr
     auto repository = std::make_unique<ExternalLoaderXMLConfigRepository>(app_path, config_path, patterns);
     shared->user_defined_executable_functions_config_repository = repository.get();
     shared->user_defined_executable_functions_xmls = external_user_defined_executable_functions_loader.addConfigRepository(std::move(repository));
+}
+
+void Context::loadExtensions(const Poco::Util::AbstractConfiguration & config)
+{
+    std::lock_guard lock(shared->extension_manager_mutex);
+    if (!shared->extension_manager)
+        shared->extension_manager = std::make_unique<ExtensionManager>(shared_from_this());
+
+    shared->extension_manager->loadFromConfig(config);
 }
 
 const IUserDefinedSQLObjectsStorage & Context::getUserDefinedSQLObjectsStorage() const

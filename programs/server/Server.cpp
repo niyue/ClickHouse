@@ -2876,6 +2876,17 @@ try
             throw;
         }
 
+        /// try to load extensions, throw on error and die
+        try
+        {
+            global_context->loadExtensions(config());
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log, "Caught exception while loading extensions.");
+            throw;
+        }
+
         if (has_zookeeper && config().has("distributed_ddl"))
         {
             /// DDL worker should be started after all tables were loaded

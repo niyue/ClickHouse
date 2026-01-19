@@ -130,6 +130,7 @@ if (ENABLE_CLICKHOUSE_SELF_EXTRACTING AND NOT ENABLE_DUMMY_LAUNCHERS)
 endif ()
 
 clickhouse_add_executable (clickhouse main.cpp)
+target_compile_definitions(clickhouse PRIVATE ALLOW_DYNAMIC_LIBRARY_LOADING)
 
 # A library that prevent usage of several functions from libc.
 if (ARCH_AMD64 AND OS_LINUX AND NOT OS_ANDROID)

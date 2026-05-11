@@ -89,8 +89,7 @@ ASTPtr UserDefinedSQLFunctionVisitor::tryToReplaceFunction(const ASTFunction & f
     auto * create_function_query = user_defined_function->as<ASTCreateSQLFunctionQuery>();
 
     if (!create_function_query)
-        throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
-            "The function '{}' is not a SQL defined function and is not supported when 'enable_analyzer' is set to false", function.formatForErrorMessage());
+        return nullptr;
 
     auto & function_core_expression = create_function_query->function_core->children.at(0);
 

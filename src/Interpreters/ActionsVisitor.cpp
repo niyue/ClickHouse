@@ -47,6 +47,7 @@
 #include <Processors/QueryPlan/QueryPlan.h>
 
 #include <Functions/UserDefined/UserDefinedExecutableFunctionFactory.h>
+#include <Functions/UserDefined/UserDefinedWebAssembly.h>
 #include <Interpreters/ActionsVisitor.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
@@ -929,6 +930,14 @@ void ActionsMatcher::visit(const ASTFunction & node, const ASTPtr & ast, Data & 
         }
 
         function_builder = UserDefinedExecutableFunctionFactory::instance().tryGet(node.name, current_context, parameters); /// NOLINT(readability-static-accessed-through-instance)
+    }
+
+    if (!function_builder && UserDefinedWebAssemblyFunctionFactory::instance().has(node.name)) /// NOLINT(readability-static-accessed-through-instance)
+    {
+        if (node.parameters)
+            throw Exception(ErrorCodes::FUNCTION_CANNOT_HAVE_PARAMETERS, "Function {} is not parametric", node.name);
+
+        function_builder = UserDefinedWebAssemblyFunctionFactory::instance().get(node.name, current_context);
     }
 
     if (!function_builder)

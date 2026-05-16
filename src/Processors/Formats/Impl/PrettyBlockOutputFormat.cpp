@@ -1,22 +1,25 @@
-#include <Processors/Formats/Impl/PrettyBlockOutputFormat.h>
-#include <Processors/Formats/Impl/VerticalRowOutputFormat.h>
-#include <Processors/Formats/IOutputFormat.h>
-#include <Processors/Port.h>
-#include <Formats/FormatFactory.h>
-#include <Formats/PrettyFormatHelpers.h>
-#include <IO/WriteBuffer.h>
-#include <IO/WriteHelpers.h>
-#include <IO/WriteBufferFromString.h>
-#include <IO/Operators.h>
-#include <Common/CurrentThread.h>
-#include <Common/UTF8Helpers.h>
-#include <Common/PODArray.h>
-#include <Common/formatReadable.h>
-#include <Common/setThreadName.h>
-#include <Common/TerminalSize.h>
-#include <Common/ThreadPool.h>
+#include <Columns/ColumnTuple.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeTuple.h>
+#include <DataTypes/NestedUtils.h>
+#include <Formats/FormatFactory.h>
+#include <Formats/PrettyFormatHelpers.h>
+#include <IO/Operators.h>
+#include <IO/WriteBuffer.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
+#include <Processors/Formats/IOutputFormat.h>
+#include <Processors/Formats/Impl/PrettyBlockOutputFormat.h>
+#include <Processors/Formats/Impl/VerticalRowOutputFormat.h>
+#include <Processors/Port.h>
+#include <Common/CurrentThread.h>
+#include <Common/PODArray.h>
+#include <Common/TerminalSize.h>
+#include <Common/ThreadPool.h>
+#include <Common/UTF8Helpers.h>
+#include <Common/formatReadable.h>
+#include <Common/setThreadName.h>
 
 #include <algorithm>
 
@@ -25,17 +28,21 @@ namespace DB
 {
 
 PrettyBlockOutputFormat::PrettyBlockOutputFormat(
-    WriteBuffer & out_, SharedHeader header_, const FormatSettings & format_settings_, Style style_, bool mono_block_, bool color_, bool glue_chunks_)
-     : IOutputFormat(header_, out_), format_settings(format_settings_), serializations(header_->getSerializations()), style(style_), mono_block(mono_block_), color(color_), glue_chunks(glue_chunks_)
+    WriteBuffer & out_,
+    SharedHeader header_,
+    const FormatSettings & format_settings_,
+    Style style_,
+    bool mono_block_,
+    bool color_,
+    bool glue_chunks_)
+    : IOutputFormat(header_, out_)
+    , format_settings(format_settings_)
+    , serializations(header_->getSerializations())
+    , style(style_)
+    , mono_block(mono_block_)
+    , color(color_)
+    , glue_chunks(glue_chunks_)
 {
-    /// Decide whether we should print a tip near the single number value in the result.
-    if (!header_->getColumns().empty())
-    {
-        /// Check if it is a numeric type, possible wrapped by Nullable or LowCardinality.
-        DataTypePtr type = removeNullable(recursiveRemoveLowCardinality(header_->getDataTypes().back()));
-        if (isNumber(type))
-            readable_number_tip = true;
-    }
     format_settings.pretty_format = true;
     format_settings.json = FormatSettings::JSON{};
     format_settings.json.pretty_print_indent_multiplier = 1;
@@ -43,42 +50,93 @@ PrettyBlockOutputFormat::PrettyBlockOutputFormat(
 
 bool PrettyBlockOutputFormat::cutInTheMiddle(size_t row_num, size_t num_rows, size_t max_rows)
 {
-    return num_rows > max_rows
-        && !(row_num < (max_rows + 1) / 2
-            || row_num >= num_rows - max_rows / 2);
+    return num_rows > max_rows && !(row_num < (max_rows + 1) / 2 || row_num >= num_rows - max_rows / 2);
+}
+
+PrettyBlockOutputFormat::DisplayColumns PrettyBlockOutputFormat::getDisplayColumns(const Block & header, const Columns & columns) const
+{
+    DisplayColumns result;
+
+    const size_t num_columns = header.columns();
+    result.groups.reserve(num_columns);
+    result.columns.reserve(num_columns);
+
+    for (size_t i = 0; i < num_columns; ++i)
+    {
+        const auto & elem = header.getByPosition(i);
+
+        DisplayColumnGroup group;
+        group.name = elem.name;
+        group.first_column = result.columns.size();
+
+        auto column = columns[i]->convertToFullColumnIfConst();
+        ColumnWithTypeAndName column_with_type{column, elem.type, elem.name};
+        column_with_type = Nested::unwrapNullableTuple(column_with_type);
+
+        const auto * tuple_type = typeid_cast<const DataTypeTuple *>(column_with_type.type.get());
+        const auto * tuple_column = typeid_cast<const ColumnTuple *>(column_with_type.column.get());
+        if (tuple_type && tuple_type->hasExplicitNames() && tuple_column)
+        {
+            group.has_subcolumns = true;
+            result.has_subcolumns = true;
+
+            const auto & element_names = tuple_type->getElementNames();
+            const auto group_index = result.groups.size();
+            for (size_t j = 0; j < tuple_type->getElements().size(); ++j)
+            {
+                const auto & element_type = tuple_type->getElement(j);
+                result.columns.push_back(
+                    {element_names[j], element_type, element_type->getDefaultSerialization(), tuple_column->getColumnPtr(j), group_index});
+            }
+        }
+        else
+        {
+            result.columns.push_back({elem.name, elem.type, serializations[i], columns[i], result.groups.size()});
+        }
+
+        group.num_columns = result.columns.size() - group.first_column;
+        result.groups.push_back(std::move(group));
+    }
+
+    return result;
 }
 
 
 /// Evaluate the visible width of the values and column names.
 /// Note that number of code points is just a rough approximation of visible string width.
 void PrettyBlockOutputFormat::calculateWidths(
-    const Block & header, const Chunk & chunk, bool split_by_lines, bool & out_has_newlines,
-    WidthsPerColumn & widths, Widths & max_padded_widths, Widths & name_widths, Strings & names)
+    const DisplayColumns & display_columns,
+    size_t num_rows,
+    bool split_by_lines,
+    bool & out_has_newlines,
+    WidthsPerColumn & widths,
+    Widths & max_padded_widths,
+    Widths & name_widths,
+    Strings & names,
+    Widths & group_name_widths,
+    Strings & group_names)
 {
-    size_t num_rows = chunk.getNumRows();
     size_t num_displayed_rows = std::min<size_t>(num_rows, format_settings.pretty.max_rows);
 
     /// len(num_rows + total_rows) + len(". ")
     prev_row_number_width = row_number_width;
-    row_number_width = num_rows + total_rows > 0
-        ? static_cast<size_t>(std::floor(std::log10(num_rows + total_rows))) + 3
-        : 3;
+    row_number_width = num_rows + total_rows > 0 ? static_cast<size_t>(std::floor(std::log10(num_rows + total_rows))) + 3 : 3;
 
-    size_t num_columns = chunk.getNumColumns();
-    const auto & columns = chunk.getColumns();
+    size_t num_columns = display_columns.columns.size();
 
     widths.resize(num_columns);
     max_padded_widths.resize_fill(num_columns);
     name_widths.resize(num_columns);
     names.resize(num_columns);
+    group_name_widths.resize(display_columns.groups.size());
+    group_names.resize(display_columns.groups.size());
 
     /// Calculate the widths of all values.
     String serialized_value;
     size_t prefix = row_number_width + (style == Style::Space ? 1 : 2); // Tab character adjustment
     for (size_t i = 0; i < num_columns; ++i)
     {
-        const auto & elem = header.getByPosition(i);
-        const auto & column = columns[i];
+        const auto & display_column = display_columns.columns[i];
 
         widths[i].resize_fill(num_displayed_rows);
 
@@ -90,8 +148,7 @@ void PrettyBlockOutputFormat::calculateWidths(
 
             {
                 WriteBufferFromString out_serialize(serialized_value);
-                auto serialization = elem.type->getDefaultSerialization();
-                serialization->serializeText(*column, j, out_serialize, format_settings);
+                display_column.serialization->serializeText(*display_column.column, j, out_serialize, format_settings);
             }
 
             /// Avoid calculating width of too long strings by limiting their size in bytes.
@@ -125,11 +182,15 @@ void PrettyBlockOutputFormat::calculateWidths(
 
                 widths[i][displayed_row] = std::max(
                     widths[i][displayed_row],
-                    UTF8::computeWidth(reinterpret_cast<const UInt8 *>(serialized_value.data() + start_from_offset), next_offset - start_from_offset, prefix));
+                    UTF8::computeWidth(
+                        reinterpret_cast<const UInt8 *>(serialized_value.data() + start_from_offset),
+                        next_offset - start_from_offset,
+                        prefix));
 
                 max_padded_widths[i] = std::max<UInt64>(
                     max_padded_widths[i],
-                    std::min<UInt64>({format_settings.pretty.max_column_pad_width, format_settings.pretty.max_value_width, widths[i][displayed_row]}));
+                    std::min<UInt64>(
+                        {format_settings.pretty.max_column_pad_width, format_settings.pretty.max_value_width, widths[i][displayed_row]}));
 
                 start_from_offset = next_offset;
                 if (start_from_offset < serialized_value.size())
@@ -141,7 +202,11 @@ void PrettyBlockOutputFormat::calculateWidths(
 
         /// Also, calculate the widths for the names of columns.
         {
-            auto [name, width] = truncateName(elem.name,
+            const auto & group = display_columns.groups[display_column.group];
+            const auto & column_name = display_columns.has_subcolumns && !group.has_subcolumns ? String{} : display_column.name;
+
+            auto [name, width] = truncateName(
+                column_name,
                 format_settings.pretty.max_column_name_width_cut_to
                     ? std::max<UInt64>(max_padded_widths[i], format_settings.pretty.max_column_name_width_cut_to)
                     : 0,
@@ -153,6 +218,57 @@ void PrettyBlockOutputFormat::calculateWidths(
             max_padded_widths[i] = std::max<UInt64>(max_padded_widths[i], name_widths[i]);
         }
         prefix += max_padded_widths[i] + 3;
+    }
+
+    auto group_width = [&](const DisplayColumnGroup & group)
+    {
+        size_t width = 0;
+        for (size_t i = 0; i < group.num_columns; ++i)
+        {
+            if (style == Style::Space)
+                width += max_padded_widths[group.first_column + i];
+            else
+                width += max_padded_widths[group.first_column + i] + 2;
+        }
+
+        if (group.num_columns > 1)
+        {
+            if (style == Style::Full)
+                width += 3 * (group.num_columns - 1);
+            else if (style == Style::Compact)
+                width += group.num_columns - 1;
+            else
+                width += 3 * (group.num_columns - 1);
+        }
+
+        return width;
+    };
+
+    if (display_columns.has_subcolumns)
+    {
+        for (size_t group_index = 0; group_index < display_columns.groups.size(); ++group_index)
+        {
+            const auto & group = display_columns.groups[group_index];
+            auto rendered_group_width = group_width(group);
+            size_t inner_width = style == Style::Space ? rendered_group_width : rendered_group_width - 2;
+
+            auto [name, width] = truncateName(
+                group.name,
+                format_settings.pretty.max_column_name_width_cut_to
+                    ? std::max<UInt64>(inner_width, format_settings.pretty.max_column_name_width_cut_to)
+                    : 0,
+                format_settings.pretty.max_column_name_width_min_chars_to_cut,
+                format_settings.pretty.charset != FormatSettings::Pretty::Charset::UTF8);
+
+            group_names[group_index] = std::move(name);
+            group_name_widths[group_index] = std::min<UInt64>(format_settings.pretty.max_column_pad_width, width);
+
+            if (group_name_widths[group_index] > inner_width)
+            {
+                const size_t extra_width = group_name_widths[group_index] - inner_width;
+                max_padded_widths[group.first_column + group.num_columns - 1] += extra_width;
+            }
+        }
     }
 }
 
@@ -169,12 +285,13 @@ void PrettyBlockOutputFormat::write(Chunk chunk, PortKind port_kind)
         {
             if (format_settings.pretty.squash_consecutive_ms && !mono_block && !thread)
             {
-                thread.emplace([this, thread_group = CurrentThread::getGroup()]
-                {
-                    ThreadGroupSwitcher switcher(thread_group, ThreadName::PRETTY_WRITER);
+                thread.emplace(
+                    [this, thread_group = CurrentThread::getGroup()]
+                    {
+                        ThreadGroupSwitcher switcher(thread_group, ThreadName::PRETTY_WRITER);
 
-                    writingThread();
-                });
+                        writingThread();
+                    });
             }
 
             if (mono_chunk)
@@ -198,7 +315,8 @@ void PrettyBlockOutputFormat::writingThread()
     Stopwatch watch(CLOCK_MONOTONIC_COARSE);
     while (!finish)
     {
-        if (std::cv_status::timeout == mono_chunk_condvar.wait_for(lock, std::chrono::milliseconds(format_settings.pretty.squash_consecutive_ms))
+        if (std::cv_status::timeout
+                == mono_chunk_condvar.wait_for(lock, std::chrono::milliseconds(format_settings.pretty.squash_consecutive_ms))
             || watch.elapsedMilliseconds() > format_settings.pretty.squash_max_wait_ms)
         {
             writeMonoChunkIfNeeded();
@@ -210,9 +328,12 @@ void PrettyBlockOutputFormat::writingThread()
 void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind)
 {
     auto num_rows = chunk.getNumRows();
-    auto num_columns = chunk.getNumColumns();
-    const auto & columns = chunk.getColumns();
+    const auto & input_columns = chunk.getColumns();
     const auto & header = getPort(port_kind).getSharedHeader();
+    auto display_columns = getDisplayColumns(*header, input_columns);
+    auto num_columns = display_columns.columns.size();
+    bool readable_number_tip_in_chunk
+        = num_columns != 0 && isNumber(removeNullable(recursiveRemoveLowCardinality(display_columns.columns.back().type)));
 
     size_t cut_to_width = format_settings.pretty.max_value_width;
     if (!format_settings.pretty.max_value_width_apply_for_single_value && num_rows == 1 && num_columns == 1 && total_rows == 0)
@@ -221,9 +342,21 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
     WidthsPerColumn widths;
     Widths max_widths;
     Widths name_widths;
+    Widths group_name_widths;
     Strings names;
+    Strings group_names;
     bool has_newlines = false;
-    calculateWidths(*header, chunk, format_settings.pretty.multiline_fields, has_newlines, widths, max_widths, name_widths, names);
+    calculateWidths(
+        display_columns,
+        num_rows,
+        format_settings.pretty.multiline_fields,
+        has_newlines,
+        widths,
+        max_widths,
+        name_widths,
+        names,
+        group_name_widths,
+        group_names);
 
     size_t table_width = 0;
     for (size_t width : max_widths)
@@ -232,8 +365,7 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
     /// Fallback to Vertical format if:
     /// enabled by the settings, this is the first chunk, the number of rows is small enough,
     /// either the table width is larger than the max_value_width or any of the values contain a newline.
-    if (format_settings.pretty.fallback_to_vertical
-        && displayed_rows == 0
+    if (format_settings.pretty.fallback_to_vertical && displayed_rows == 0
         && num_rows <= format_settings.pretty.fallback_to_vertical_max_rows_per_chunk
         && num_columns >= format_settings.pretty.fallback_to_vertical_min_columns
         && (table_width >= format_settings.pretty.fallback_to_vertical_min_table_width || has_newlines))
@@ -253,7 +385,7 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
         {
             if (i != 0)
                 vertical_format_fallback->writeRowBetweenDelimiter();
-            vertical_format_fallback->writeRow(columns, i);
+            vertical_format_fallback->writeRow(input_columns, i);
             ++displayed_rows;
         }
 
@@ -266,19 +398,18 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
     if (format_settings.pretty.row_numbers)
         left_blank.assign(row_number_width, ' ');
 
-    String header_begin;    /// ┏━━┳━━━┓
-    String header_end;      /// ┡━━╇━━━┩
-    String rows_separator;  /// ├──┼───┤
-    String rows_end;        /// └──┴───┘
-    String footer_begin;    /// ┢━━╈━━━┪
-    String footer_end;      /// ┗━━┻━━━┛
+    String header_begin; /// ┏━━┳━━━┓
+    String header_end; /// ┡━━╇━━━┩
+    String rows_separator; /// ├──┼───┤
+    String rows_end; /// └──┴───┘
+    String footer_begin; /// ┢━━╈━━━┪
+    String footer_end; /// ┗━━┻━━━┛
 
     bool unicode = format_settings.pretty.charset == FormatSettings::Pretty::Charset::UTF8;
     using GridPart = std::array<std::string_view, 4>;
     using Grid = std::array<GridPart, 7>;
 
-    constexpr Grid utf8_grid
-    {
+    constexpr Grid utf8_grid{
         GridPart{"┏", "━", "┳", "┓"},
         GridPart{"┡", "━", "╇", "┩"},
         GridPart{"├", "─", "┼", "┤"},
@@ -288,8 +419,7 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
         GridPart{"┌", "─", "┬", "┐"},
     };
 
-    constexpr Grid ascii_grid
-    {
+    constexpr Grid ascii_grid{
         GridPart{"+", "-", "+", "+"},
         GridPart{"+", "-", "+", "+"},
         GridPart{"+", "-", "+", "+"},
@@ -301,9 +431,9 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
 
     Grid grid = unicode ? utf8_grid : ascii_grid;
 
-    std::string_view vertical_bold_bar   = unicode ? "┃" : "|";
-    std::string_view vertical_bar        = unicode ? "│" : "|";
-    std::string_view horizontal_bar      = unicode ? "─" : "-";
+    std::string_view vertical_bold_bar = unicode ? "┃" : "|";
+    std::string_view vertical_bar = unicode ? "│" : "|";
+    std::string_view horizontal_bar = unicode ? "─" : "-";
 
     if (style == Style::Full)
     {
@@ -321,42 +451,42 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
         WriteBufferFromString footer_begin_out(footer_begin, AppendModeTag{});
         WriteBufferFromString footer_end_out(footer_end, AppendModeTag{});
 
-        header_begin_out    << grid[0][0];
-        header_end_out      << grid[1][0];
-        rows_separator_out  << grid[2][0];
-        rows_end_out        << grid[3][0];
-        footer_begin_out    << grid[4][0];
-        footer_end_out      << grid[5][0];
+        header_begin_out << grid[0][0];
+        header_end_out << grid[1][0];
+        rows_separator_out << grid[2][0];
+        rows_end_out << grid[3][0];
+        footer_begin_out << grid[4][0];
+        footer_end_out << grid[5][0];
 
         for (size_t i = 0; i < num_columns; ++i)
         {
             if (i != 0)
             {
-                header_begin_out    << grid[0][2];
-                header_end_out      << grid[1][2];
-                rows_separator_out  << grid[2][2];
-                rows_end_out        << grid[3][2];
-                footer_begin_out    << grid[4][2];
-                footer_end_out      << grid[5][2];
+                header_begin_out << grid[0][2];
+                header_end_out << grid[1][2];
+                rows_separator_out << grid[2][2];
+                rows_end_out << grid[3][2];
+                footer_begin_out << grid[4][2];
+                footer_end_out << grid[5][2];
             }
 
             for (size_t j = 0; j < max_widths[i] + 2; ++j)
             {
-                header_begin_out    << grid[0][1];
-                header_end_out      << grid[1][1];
-                rows_separator_out  << grid[2][1];
-                rows_end_out        << grid[3][1];
-                footer_begin_out    << grid[4][1];
-                footer_end_out      << grid[5][1];
+                header_begin_out << grid[0][1];
+                header_end_out << grid[1][1];
+                rows_separator_out << grid[2][1];
+                rows_end_out << grid[3][1];
+                footer_begin_out << grid[4][1];
+                footer_end_out << grid[5][1];
             }
         }
 
-        header_begin_out    << grid[0][3] << "\n";
-        header_end_out      << grid[1][3] << "\n";
-        rows_separator_out  << grid[2][3] << "\n";
-        rows_end_out        << grid[3][3] << "\n";
-        footer_begin_out    << grid[4][3] << "\n";
-        footer_end_out      << grid[5][3] << "\n";
+        header_begin_out << grid[0][3] << "\n";
+        header_end_out << grid[1][3] << "\n";
+        rows_separator_out << grid[2][3] << "\n";
+        rows_end_out << grid[3][3] << "\n";
+        footer_begin_out << grid[4][3] << "\n";
+        footer_end_out << grid[5][3] << "\n";
     }
     else if (style == Style::Compact)
     {
@@ -406,6 +536,182 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
     ///      name
     auto write_names = [&](bool is_top) -> void
     {
+        auto write_value = [&](const String & name)
+        {
+            if (color)
+                out << "\033[1m";
+            writeString(name, out);
+            if (color)
+                out << "\033[0m";
+        };
+
+        auto write_padding = [&](size_t width)
+        {
+            for (size_t k = 0; k < width; ++k)
+            {
+                if (style == Style::Compact)
+                    out << horizontal_bar;
+                else
+                    out << " ";
+            }
+        };
+
+        auto write_name_with_padding = [&](const String & name, size_t name_width, size_t pad_to_width, bool align_right)
+        {
+            pad_to_width = std::max(pad_to_width, name_width);
+            if (align_right)
+            {
+                write_padding(pad_to_width - name_width);
+                write_value(name);
+            }
+            else
+            {
+                write_value(name);
+                write_padding(pad_to_width - name_width);
+            }
+        };
+
+        auto group_width = [&](const DisplayColumnGroup & group)
+        {
+            size_t width = 0;
+            for (size_t i = 0; i < group.num_columns; ++i)
+            {
+                if (style == Style::Space)
+                    width += max_widths[group.first_column + i];
+                else
+                    width += max_widths[group.first_column + i] + 2;
+            }
+
+            if (group.num_columns > 1)
+            {
+                if (style == Style::Full)
+                    width += 3 * (group.num_columns - 1);
+                else if (style == Style::Compact)
+                    width += group.num_columns - 1;
+                else
+                    width += 3 * (group.num_columns - 1);
+            }
+
+            return width;
+        };
+
+        if (display_columns.has_subcolumns && is_top && style == Style::Compact)
+        {
+            writeString(left_blank, out);
+            out << grid[6][0];
+
+            for (size_t i = 0; i < display_columns.groups.size(); ++i)
+            {
+                const auto & group = display_columns.groups[i];
+                if (i != 0)
+                    out << grid[6][2];
+
+                const auto width = group_width(group);
+                out << horizontal_bar;
+                const bool align_right = group.num_columns == 1 && !group.has_subcolumns
+                    && display_columns.columns[group.first_column].type->shouldAlignRightInPrettyFormats();
+                write_name_with_padding(group_names[i], group_name_widths[i], width - 2, align_right);
+                out << horizontal_bar;
+            }
+
+            out << grid[6][3] << "\n";
+
+            writeString(left_blank, out);
+            out << grid[2][0];
+            for (size_t i = 0; i < num_columns; ++i)
+            {
+                if (i != 0)
+                {
+                    if (display_columns.columns[i].group == display_columns.columns[i - 1].group)
+                        out << grid[6][2];
+                    else
+                        out << grid[2][2];
+                }
+
+                const auto & group = display_columns.groups[display_columns.columns[i].group];
+                out << horizontal_bar;
+                if (group.has_subcolumns)
+                    write_name_with_padding(
+                        names[i], name_widths[i], max_widths[i], display_columns.columns[i].type->shouldAlignRightInPrettyFormats());
+                else
+                    write_padding(max_widths[i]);
+                out << horizontal_bar;
+            }
+            out << grid[2][3] << "\n";
+            return;
+        }
+
+        if (display_columns.has_subcolumns && is_top && style == Style::Full)
+        {
+            writeString(left_blank, out);
+            out << vertical_bold_bar << " ";
+            for (size_t i = 0; i < display_columns.groups.size(); ++i)
+            {
+                if (i != 0)
+                    out << " " << vertical_bold_bar << " ";
+
+                const auto & group = display_columns.groups[i];
+                const auto width = group_width(group);
+                const bool align_right = group.num_columns == 1 && !group.has_subcolumns
+                    && display_columns.columns[group.first_column].type->shouldAlignRightInPrettyFormats();
+                write_name_with_padding(group_names[i], group_name_widths[i], width - 2, align_right);
+            }
+            out << " " << vertical_bold_bar << "\n";
+
+            writeString(rows_separator, out);
+
+            writeString(left_blank, out);
+            out << vertical_bold_bar << " ";
+            for (size_t i = 0; i < num_columns; ++i)
+            {
+                if (i != 0)
+                    out << " " << vertical_bold_bar << " ";
+
+                const auto & group = display_columns.groups[display_columns.columns[i].group];
+                if (group.has_subcolumns)
+                    write_name_with_padding(
+                        names[i], name_widths[i], max_widths[i], display_columns.columns[i].type->shouldAlignRightInPrettyFormats());
+                else
+                    write_padding(max_widths[i]);
+            }
+            out << " " << vertical_bold_bar << "\n";
+            return;
+        }
+
+        if (display_columns.has_subcolumns && is_top && style == Style::Space)
+        {
+            writeString(left_blank, out);
+            out << " ";
+            for (size_t i = 0; i < display_columns.groups.size(); ++i)
+            {
+                if (i != 0)
+                    out << "   ";
+
+                const auto & group = display_columns.groups[i];
+                const bool align_right = group.num_columns == 1 && !group.has_subcolumns
+                    && display_columns.columns[group.first_column].type->shouldAlignRightInPrettyFormats();
+                write_name_with_padding(group_names[i], group_name_widths[i], group_width(group), align_right);
+            }
+            out << "\n";
+
+            writeString(left_blank, out);
+            out << " ";
+            for (size_t i = 0; i < num_columns; ++i)
+            {
+                if (i != 0)
+                    out << "   ";
+
+                const auto & group = display_columns.groups[display_columns.columns[i].group];
+                if (group.has_subcolumns)
+                    write_name_with_padding(
+                        names[i], name_widths[i], max_widths[i], display_columns.columns[i].type->shouldAlignRightInPrettyFormats());
+                else
+                    write_padding(max_widths[i]);
+            }
+            out << "\n";
+            return;
+        }
+
         writeString(left_blank, out);
 
         if (style == Style::Full)
@@ -427,38 +733,8 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
                     out << "   ";
             }
 
-            const auto & col = header->getByPosition(i);
-
-            auto write_value = [&]
-            {
-                if (color)
-                    out << "\033[1m";
-                writeString(names[i], out);
-                if (color)
-                    out << "\033[0m";
-            };
-
-            auto write_padding = [&]
-            {
-                for (size_t k = 0; k < max_widths[i] - name_widths[i]; ++k)
-                {
-                    if (style == Style::Compact)
-                        out << horizontal_bar;
-                    else
-                        out << " ";
-                }
-            };
-
-            if (col.type->shouldAlignRightInPrettyFormats())
-            {
-                write_padding();
-                write_value();
-            }
-            else
-            {
-                write_value();
-                write_padding();
-            }
+            write_name_with_padding(
+                names[i], name_widths[i], max_widths[i], display_columns.columns[i].type->shouldAlignRightInPrettyFormats());
         }
         if (style == Style::Full)
             out << " " << vertical_bold_bar;
@@ -468,9 +744,7 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
         out << "\n";
     };
 
-    if (glue_chunks
-        && port_kind == PortKind::Main
-        && (!format_settings.pretty.row_numbers || row_number_width == prev_row_number_width)
+    if (glue_chunks && port_kind == PortKind::Main && (!format_settings.pretty.row_numbers || row_number_width == prev_row_number_width)
         && max_widths == prev_chunk_max_widths)
     {
         /// Move cursor up to overwrite the footer of the previous chunk:
@@ -554,12 +828,14 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
                     else if (j != 0)
                         out << " ";
 
-                    const auto & type = header->getByPosition(j).type;
+                    const auto & type = display_columns.columns[j].type;
                     writeValueWithPadding(
-                        *columns[j],
-                        *serializations[j],
+                        *display_columns.columns[j].column,
+                        *display_columns.columns[j].serialization,
                         i,
-                        format_settings.pretty.multiline_fields, serialized_values[j], offsets_inside_serialized_values[j],
+                        format_settings.pretty.multiline_fields,
+                        serialized_values[j],
+                        offsets_inside_serialized_values[j],
                         widths[j].empty() ? max_widths[j] : widths[j][displayed_row],
                         max_widths[j],
                         cut_to_width,
@@ -573,7 +849,7 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
                 if (style != Style::Space)
                     out << vertical_bar;
 
-                if (readable_number_tip)
+                if (readable_number_tip_in_chunk)
                 {
                     size_t term_width = getTerminalWidth();
                     size_t visible_table_width = format_settings.pretty.row_numbers ? row_number_width : 0;
@@ -595,7 +871,7 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
                         remaining_width = term_width - visible_table_width;
 
                     if (remaining_width > 0)
-                        writeReadableNumberTip(out, *columns.back(), i, format_settings, color, remaining_width);
+                        writeReadableNumberTip(out, *display_columns.columns.back().column, i, format_settings, color, remaining_width);
                 }
 
                 out << "\n";
@@ -628,9 +904,17 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
 
 
 void PrettyBlockOutputFormat::writeValueWithPadding(
-    const IColumn & column, const ISerialization & serialization, size_t row_num,
-    bool split_by_lines, std::optional<String> & serialized_value, size_t & start_from_offset,
-    size_t value_width, size_t pad_to_width, size_t cut_to_width, bool align_right, bool is_number)
+    const IColumn & column,
+    const ISerialization & serialization,
+    size_t row_num,
+    bool split_by_lines,
+    std::optional<String> & serialized_value,
+    size_t & start_from_offset,
+    size_t value_width,
+    size_t pad_to_width,
+    size_t cut_to_width,
+    bool align_right,
+    bool is_number)
 {
     if (!serialized_value)
     {
@@ -682,7 +966,10 @@ void PrettyBlockOutputFormat::writeValueWithPadding(
     {
         is_cut = true;
         serialized_fragment.resize(UTF8::computeBytesBeforeWidth(
-            reinterpret_cast<const UInt8 *>(serialized_fragment.data()), serialized_fragment.size(), prefix, format_settings.pretty.max_value_width));
+            reinterpret_cast<const UInt8 *>(serialized_fragment.data()),
+            serialized_fragment.size(),
+            prefix,
+            format_settings.pretty.max_value_width));
 
         if (color)
         {
@@ -814,7 +1101,8 @@ void PrettyBlockOutputFormat::onRowsReadBeforeUpdate()
 void registerOutputFormatPretty(FormatFactory & factory)
 {
     /// Various combinations are available under their own names, e.g. PrettyCompactNoEscapesMonoBlock.
-    for (auto style : {PrettyBlockOutputFormat::Style::Full, PrettyBlockOutputFormat::Style::Compact, PrettyBlockOutputFormat::Style::Space})
+    for (auto style :
+         {PrettyBlockOutputFormat::Style::Full, PrettyBlockOutputFormat::Style::Compact, PrettyBlockOutputFormat::Style::Space})
     {
         for (bool no_escapes : {false, true})
         {
@@ -832,18 +1120,23 @@ void registerOutputFormatPretty(FormatFactory & factory)
                 if (mono_block)
                     name += "MonoBlock";
 
-                factory.registerOutputFormat(name, [style, no_escapes, mono_block](
-                    WriteBuffer & buf,
-                    const Block & sample,
-                    const FormatSettings & format_settings,
-                    FormatFilterInfoPtr /*format_filter_info*/)
-                {
-                    bool color = !no_escapes
-                        && (format_settings.pretty.color == 1 || (format_settings.pretty.color == 2 && format_settings.is_writing_to_terminal));
-                    bool glue_chunks = !no_escapes
-                        && (format_settings.pretty.glue_chunks == 1 || (format_settings.pretty.glue_chunks == 2 && format_settings.is_writing_to_terminal));
-                    return std::make_shared<PrettyBlockOutputFormat>(buf, std::make_shared<const Block>(sample), format_settings, style, mono_block, color, glue_chunks);
-                });
+                factory.registerOutputFormat(
+                    name,
+                    [style, no_escapes, mono_block](
+                        WriteBuffer & buf,
+                        const Block & sample,
+                        const FormatSettings & format_settings,
+                        FormatFilterInfoPtr /*format_filter_info*/)
+                    {
+                        bool color = !no_escapes
+                            && (format_settings.pretty.color == 1
+                                || (format_settings.pretty.color == 2 && format_settings.is_writing_to_terminal));
+                        bool glue_chunks = !no_escapes
+                            && (format_settings.pretty.glue_chunks == 1
+                                || (format_settings.pretty.glue_chunks == 2 && format_settings.is_writing_to_terminal));
+                        return std::make_shared<PrettyBlockOutputFormat>(
+                            buf, std::make_shared<const Block>(sample), format_settings, style, mono_block, color, glue_chunks);
+                    });
             }
         }
     }

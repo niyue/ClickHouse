@@ -3,6 +3,8 @@
 #include <Formats/FormatSettings.h>
 #include <Processors/Formats/IRowOutputFormat.h>
 
+#include <optional>
+
 
 namespace DB
 {
@@ -23,6 +25,7 @@ public:
     String getName() const override { return "VerticalRowOutputFormat"; }
 
 private:
+    void write(const Columns & columns, size_t row_num) override;
     void writeField(const IColumn & column, const ISerialization & serialization, size_t row_num) override;
     void writeRowStartDelimiter() override;
     void writeRowBetweenDelimiter() override;
@@ -44,15 +47,24 @@ private:
 
     /// For totals and extremes.
     void writeSpecialRow(const Columns & columns, size_t row_num, const char * title);
+    Columns getDisplayColumns(const Columns & columns);
 
-    void resetFormatterImpl() override
-    {
-        row_number = 0;
-    }
+    void resetFormatterImpl() override { row_number = 0; }
 
     const FormatSettings format_settings;
     size_t field_number = 0;
     size_t row_number = 0;
+
+    struct DisplayField
+    {
+        String name;
+        DataTypePtr type;
+        SerializationPtr serialization;
+        size_t source_column;
+        std::optional<size_t> tuple_element;
+    };
+
+    std::vector<DisplayField> fields;
 
     using NamesAndPaddings = std::vector<String>;
     NamesAndPaddings names_and_paddings;

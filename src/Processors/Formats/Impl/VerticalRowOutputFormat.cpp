@@ -1,46 +1,76 @@
 #include <cmath>
 
-#include <IO/WriteHelpers.h>
-#include <IO/WriteBufferFromString.h>
-#include <Processors/Formats/Impl/VerticalRowOutputFormat.h>
-#include <Formats/FormatFactory.h>
-#include <Formats/PrettyFormatHelpers.h>
-#include <Common/UTF8Helpers.h>
+#include <Columns/ColumnTuple.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/IDataType.h>
+#include <DataTypes/NestedUtils.h>
+#include <Formats/FormatFactory.h>
+#include <Formats/PrettyFormatHelpers.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
+#include <Processors/Formats/Impl/VerticalRowOutputFormat.h>
 #include <Processors/Port.h>
+#include <Common/UTF8Helpers.h>
+#include <Common/assert_cast.h>
 
 
 namespace DB
 {
 
-VerticalRowOutputFormat::VerticalRowOutputFormat(
-    WriteBuffer & out_, SharedHeader header_, const FormatSettings & format_settings_)
-    : IRowOutputFormat(std::move(header_), out_), format_settings(format_settings_)
+VerticalRowOutputFormat::VerticalRowOutputFormat(WriteBuffer & out_, SharedHeader header_, const FormatSettings & format_settings_)
+    : IRowOutputFormat(std::move(header_), out_)
+    , format_settings(format_settings_)
 {
     color = format_settings.pretty.color == 1 || (format_settings.pretty.color == 2 && format_settings.is_writing_to_terminal);
 
     const auto & sample = getPort(PortKind::Main).getHeader();
     size_t columns = sample.columns();
 
-    using Widths = std::vector<size_t>;
-    Widths name_widths(columns);
-    size_t max_name_width = 0;
-
-    names_and_paddings.resize(columns);
-    is_number.resize(columns);
-    is_json.resize(columns);
-
+    fields.reserve(columns);
     for (size_t i = 0; i < columns; ++i)
     {
-        /// Note that number of code points is just a rough approximation of visible string width.
-        const String & name = sample.getByPosition(i).name;
+        const auto & elem = sample.getByPosition(i);
+        const auto * nullable_type = typeid_cast<const DataTypeNullable *>(elem.type.get());
+        const auto * tuple_type = typeid_cast<const DataTypeTuple *>((nullable_type ? nullable_type->getNestedType() : elem.type).get());
 
-        auto [name_cut, width] = truncateName(name,
-          format_settings.pretty.max_column_name_width_cut_to,
-          format_settings.pretty.max_column_name_width_min_chars_to_cut,
-          format_settings.pretty.charset != FormatSettings::Pretty::Charset::UTF8);
+        if (tuple_type && tuple_type->hasExplicitNames())
+        {
+            const auto & element_names = tuple_type->getElementNames();
+            for (size_t j = 0; j < tuple_type->getElements().size(); ++j)
+            {
+                DataTypePtr element_type = tuple_type->getElement(j);
+                if (nullable_type && element_type->canBeInsideNullable() && !element_type->isNullable())
+                    element_type = std::make_shared<DataTypeNullable>(element_type);
+
+                fields.push_back({elem.name + "." + element_names[j], element_type, element_type->getDefaultSerialization(), i, j});
+            }
+        }
+        else
+        {
+            fields.push_back({elem.name, elem.type, serializations[i], i, std::nullopt});
+        }
+    }
+
+    using Widths = std::vector<size_t>;
+    Widths name_widths(fields.size());
+    size_t max_name_width = 0;
+
+    names_and_paddings.resize(fields.size());
+    is_number.resize(fields.size());
+    is_json.resize(fields.size());
+
+    for (size_t i = 0; i < fields.size(); ++i)
+    {
+        /// Note that number of code points is just a rough approximation of visible string width.
+        const String & name = fields[i].name;
+
+        auto [name_cut, width] = truncateName(
+            name,
+            format_settings.pretty.max_column_name_width_cut_to,
+            format_settings.pretty.max_column_name_width_min_chars_to_cut,
+            format_settings.pretty.charset != FormatSettings::Pretty::Charset::UTF8);
 
         name_widths[i] = width;
         max_name_width = std::max(width, max_name_width);
@@ -50,14 +80,56 @@ VerticalRowOutputFormat::VerticalRowOutputFormat(
             names_and_paddings[i] = name_cut + ": ";
     }
 
-    for (size_t i = 0; i < columns; ++i)
+    for (size_t i = 0; i < fields.size(); ++i)
     {
         size_t new_size = max_name_width - name_widths[i] + names_and_paddings[i].size();
         names_and_paddings[i].resize(new_size, ' ');
-        const auto & type = removeNullable(recursiveRemoveLowCardinality(sample.getByPosition(i).type));
+        const auto & type = removeNullable(recursiveRemoveLowCardinality(fields[i].type));
         is_number[i] = isNumber(type);
         is_json[i] = isObject(type);
     }
+}
+
+Columns VerticalRowOutputFormat::getDisplayColumns(const Columns & columns)
+{
+    Columns result;
+    result.reserve(fields.size());
+
+    const auto & sample = getPort(PortKind::Main).getHeader();
+    for (const auto & field : fields)
+    {
+        if (!field.tuple_element)
+        {
+            result.push_back(columns[field.source_column]);
+            continue;
+        }
+
+        const auto & elem = sample.getByPosition(field.source_column);
+        auto column = columns[field.source_column]->convertToFullColumnIfConst();
+        ColumnWithTypeAndName column_with_type{column, elem.type, elem.name};
+        column_with_type = Nested::unwrapNullableTuple(column_with_type);
+
+        const auto & tuple_column = assert_cast<const ColumnTuple &>(*column_with_type.column);
+        result.push_back(tuple_column.getColumnPtr(*field.tuple_element));
+    }
+
+    return result;
+}
+
+void VerticalRowOutputFormat::write(const Columns & columns, size_t row_num)
+{
+    writeRowStartDelimiter();
+
+    auto display_columns = getDisplayColumns(columns);
+    for (size_t i = 0; i < fields.size(); ++i)
+    {
+        if (i != 0)
+            writeFieldDelimiter();
+
+        writeField(*display_columns[i], *fields[i].serialization, row_num);
+    }
+
+    writeRowEndDelimiter();
 }
 
 
@@ -82,9 +154,9 @@ void VerticalRowOutputFormat::writeValue(const IColumn & column, const ISerializ
         serialization.serializeTextJSONPretty(column, row_num, out, format_settings, indent);
     }
     /// If we need highlighting.
-    else if (color
-        && ((format_settings.pretty.highlight_digit_groups && is_number[field_number])
-            || format_settings.pretty.highlight_trailing_spaces))
+    else if (
+        color
+        && ((format_settings.pretty.highlight_digit_groups && is_number[field_number]) || format_settings.pretty.highlight_trailing_spaces))
     {
         String serialized_value;
         {
@@ -185,8 +257,6 @@ void VerticalRowOutputFormat::writeSpecialRow(const Columns & columns, size_t ro
     row_number = 0;
     field_number = 0;
 
-    size_t columns_size = columns.size();
-
     writeCString(title, out);
     writeCString(":\n", out);
 
@@ -195,20 +265,17 @@ void VerticalRowOutputFormat::writeSpecialRow(const Columns & columns, size_t ro
         writeCString("─", out);
     writeChar('\n', out);
 
-    for (size_t i = 0; i < columns_size; ++i)
-        writeField(*columns[i], *serializations[i], row_num);
+    auto display_columns = getDisplayColumns(columns);
+    for (size_t i = 0; i < fields.size(); ++i)
+        writeField(*display_columns[i], *fields[i].serialization, row_num);
 }
 
 void registerOutputFormatVertical(FormatFactory & factory)
 {
-    factory.registerOutputFormat("Vertical", [](
-        WriteBuffer & buf,
-        const Block & sample,
-        const FormatSettings & settings,
-        FormatFilterInfoPtr /*format_filter_info*/)
-    {
-        return std::make_shared<VerticalRowOutputFormat>(buf, std::make_shared<const Block>(sample), settings);
-    });
+    factory.registerOutputFormat(
+        "Vertical",
+        [](WriteBuffer & buf, const Block & sample, const FormatSettings & settings, FormatFilterInfoPtr /*format_filter_info*/)
+        { return std::make_shared<VerticalRowOutputFormat>(buf, std::make_shared<const Block>(sample), settings); });
 
     factory.markOutputFormatSupportsParallelFormatting("Vertical");
 }

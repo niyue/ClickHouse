@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Columns/IColumn.h>
 #include <DataTypes/Serializations/ISerialization.h>
 #include <Formats/FormatFactory.h>
 #include <Formats/FormatSettings.h>
@@ -22,13 +23,20 @@ class PrettyBlockOutputFormat : public IOutputFormat
 public:
     enum class Style
     {
-        Full,    /// Table borders are displayed between every row.
+        Full, /// Table borders are displayed between every row.
         Compact, /// Table borders only for outline, but not between rows.
-        Space,   /// Blank spaces instead of table borders.
+        Space, /// Blank spaces instead of table borders.
     };
 
     /// no_escapes - do not use ANSI escape sequences - to display in the browser, not in the console.
-    PrettyBlockOutputFormat(WriteBuffer & out_, SharedHeader header_, const FormatSettings & format_settings_, Style style_, bool mono_block_, bool color_, bool glue_chunks_);
+    PrettyBlockOutputFormat(
+        WriteBuffer & out_,
+        SharedHeader header_,
+        const FormatSettings & format_settings_,
+        Style style_,
+        bool mono_block_,
+        bool color_,
+        bool glue_chunks_);
     ~PrettyBlockOutputFormat() override;
 
     String getName() const override { return "PrettyBlockOutputFormat"; }
@@ -49,6 +57,30 @@ protected:
     using Widths = PODArray<size_t>;
     using WidthsPerColumn = std::vector<Widths>;
 
+    struct DisplayColumn
+    {
+        String name;
+        DataTypePtr type;
+        SerializationPtr serialization;
+        ColumnPtr column;
+        size_t group;
+    };
+
+    struct DisplayColumnGroup
+    {
+        String name;
+        size_t first_column;
+        size_t num_columns = 0;
+        bool has_subcolumns = false;
+    };
+
+    struct DisplayColumns
+    {
+        std::vector<DisplayColumn> columns;
+        std::vector<DisplayColumnGroup> groups;
+        bool has_subcolumns = false;
+    };
+
     void write(Chunk chunk, PortKind port_kind);
     virtual void writeChunk(const Chunk & chunk, PortKind port_kind);
     void writeMonoChunkIfNeeded();
@@ -58,13 +90,31 @@ protected:
     void onRowsReadBeforeUpdate() override;
 
     void calculateWidths(
-        const Block & header, const Chunk & chunk, bool split_by_lines, bool & out_has_newlines,
-        WidthsPerColumn & widths, Widths & max_padded_widths, Widths & name_widths, Strings & names);
+        const DisplayColumns & display_columns,
+        size_t num_rows,
+        bool split_by_lines,
+        bool & out_has_newlines,
+        WidthsPerColumn & widths,
+        Widths & max_padded_widths,
+        Widths & name_widths,
+        Strings & names,
+        Widths & group_name_widths,
+        Strings & group_names);
+
+    DisplayColumns getDisplayColumns(const Block & header, const Columns & columns) const;
 
     void writeValueWithPadding(
-        const IColumn & column, const ISerialization & serialization, size_t row_num,
-        bool split_by_lines, std::optional<String> & serialized_value, size_t & start_from_offset,
-        size_t value_width, size_t pad_to_width, size_t cut_to_width, bool align_right, bool is_number);
+        const IColumn & column,
+        const ISerialization & serialization,
+        size_t row_num,
+        bool split_by_lines,
+        std::optional<String> & serialized_value,
+        size_t & start_from_offset,
+        size_t value_width,
+        size_t pad_to_width,
+        size_t cut_to_width,
+        bool align_right,
+        bool is_number);
 
     void resetFormatterImpl() override
     {
@@ -74,8 +124,6 @@ protected:
     }
 
     static bool cutInTheMiddle(size_t row_num, size_t num_rows, size_t max_rows);
-
-    bool readable_number_tip = false;
 
 private:
     Style style;

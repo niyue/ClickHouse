@@ -234,7 +234,7 @@ void PrettyBlockOutputFormat::calculateWidths(
         if (group.num_columns > 1)
         {
             if (style == Style::Full)
-                width += 3 * (group.num_columns - 1);
+                width += group.num_columns - 1;
             else if (style == Style::Compact)
                 width += group.num_columns - 1;
             else
@@ -435,6 +435,30 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
     std::string_view vertical_bar = unicode ? "│" : "|";
     std::string_view horizontal_bar = unicode ? "─" : "-";
 
+    auto get_group_width = [&](const DisplayColumnGroup & group)
+    {
+        size_t width = 0;
+        for (size_t i = 0; i < group.num_columns; ++i)
+        {
+            if (style == Style::Space)
+                width += max_widths[group.first_column + i];
+            else
+                width += max_widths[group.first_column + i] + 2;
+        }
+
+        if (group.num_columns > 1)
+        {
+            if (style == Style::Full)
+                width += group.num_columns - 1;
+            else if (style == Style::Compact)
+                width += group.num_columns - 1;
+            else
+                width += 3 * (group.num_columns - 1);
+        }
+
+        return width;
+    };
+
     if (style == Style::Full)
     {
         header_begin = left_blank;
@@ -458,11 +482,25 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
         footer_begin_out << grid[4][0];
         footer_end_out << grid[5][0];
 
+        if (display_columns.has_subcolumns)
+        {
+            for (size_t i = 0; i < display_columns.groups.size(); ++i)
+            {
+                if (i != 0)
+                    header_begin_out << grid[0][2];
+
+                const auto group_width = get_group_width(display_columns.groups[i]);
+                for (size_t j = 0; j < group_width; ++j)
+                    header_begin_out << grid[0][1];
+            }
+        }
+
         for (size_t i = 0; i < num_columns; ++i)
         {
             if (i != 0)
             {
-                header_begin_out << grid[0][2];
+                if (!display_columns.has_subcolumns)
+                    header_begin_out << grid[0][2];
                 header_end_out << grid[1][2];
                 rows_separator_out << grid[2][2];
                 rows_end_out << grid[3][2];
@@ -472,7 +510,8 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
 
             for (size_t j = 0; j < max_widths[i] + 2; ++j)
             {
-                header_begin_out << grid[0][1];
+                if (!display_columns.has_subcolumns)
+                    header_begin_out << grid[0][1];
                 header_end_out << grid[1][1];
                 rows_separator_out << grid[2][1];
                 rows_end_out << grid[3][1];
@@ -585,7 +624,7 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
             if (group.num_columns > 1)
             {
                 if (style == Style::Full)
-                    width += 3 * (group.num_columns - 1);
+                    width += group.num_columns - 1;
                 else if (style == Style::Compact)
                     width += group.num_columns - 1;
                 else

@@ -11,6 +11,5 @@
    └───────┴───┴───────┘
 Row 1:
 ──────
-x:   hello
-t.a: 1
-t.b: world
+x: hello
+t: (1,'world')

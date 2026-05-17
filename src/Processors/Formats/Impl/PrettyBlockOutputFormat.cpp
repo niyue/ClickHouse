@@ -434,6 +434,10 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
     std::string_view vertical_bold_bar = unicode ? "┃" : "|";
     std::string_view vertical_bar = unicode ? "│" : "|";
     std::string_view horizontal_bar = unicode ? "─" : "-";
+    std::string_view header_group_separator_left = unicode ? "┣" : "+";
+    std::string_view header_group_separator_group = unicode ? "╋" : "+";
+    std::string_view header_group_separator_child = unicode ? "┳" : "+";
+    std::string_view header_group_separator_right = unicode ? "┫" : "+";
 
     auto get_group_width = [&](const DisplayColumnGroup & group)
     {
@@ -682,6 +686,26 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
 
         if (display_columns.has_subcolumns && is_top && style == Style::Full)
         {
+            auto write_header_group_separator = [&]
+            {
+                writeString(left_blank, out);
+                out << header_group_separator_left;
+                for (size_t i = 0; i < num_columns; ++i)
+                {
+                    if (i != 0)
+                    {
+                        if (display_columns.columns[i].group == display_columns.columns[i - 1].group)
+                            out << header_group_separator_child;
+                        else
+                            out << header_group_separator_group;
+                    }
+
+                    for (size_t j = 0; j < max_widths[i] + 2; ++j)
+                        out << grid[0][1];
+                }
+                out << header_group_separator_right << "\n";
+            };
+
             writeString(left_blank, out);
             out << vertical_bold_bar << " ";
             for (size_t i = 0; i < display_columns.groups.size(); ++i)
@@ -697,7 +721,7 @@ void PrettyBlockOutputFormat::writeChunk(const Chunk & chunk, PortKind port_kind
             }
             out << " " << vertical_bold_bar << "\n";
 
-            writeString(rows_separator, out);
+            write_header_group_separator();
 
             writeString(left_blank, out);
             out << vertical_bold_bar << " ";

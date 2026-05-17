@@ -12,4 +12,7 @@
 Row 1:
 ──────
 x: hello
-t: (1,'world')
+t: {
+  "a": 1,
+  "b": "world"
+}

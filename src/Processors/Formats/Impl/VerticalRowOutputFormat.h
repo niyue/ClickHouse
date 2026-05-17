@@ -51,6 +51,7 @@ private:
     }
 
     const FormatSettings format_settings;
+    const FormatSettings text_format_settings;
     size_t field_number = 0;
     size_t row_number = 0;
 

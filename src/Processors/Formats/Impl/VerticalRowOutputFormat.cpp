@@ -15,9 +15,23 @@
 namespace DB
 {
 
+namespace
+{
+
+FormatSettings prepareTextFormatSettings(FormatSettings settings)
+{
+    settings.pretty_format = true;
+    settings.json.pretty_print_indent_multiplier = 1;
+    return settings;
+}
+
+}
+
 VerticalRowOutputFormat::VerticalRowOutputFormat(
     WriteBuffer & out_, SharedHeader header_, const FormatSettings & format_settings_)
-    : IRowOutputFormat(std::move(header_), out_), format_settings(format_settings_)
+    : IRowOutputFormat(std::move(header_), out_)
+    , format_settings(format_settings_)
+    , text_format_settings(prepareTextFormatSettings(format_settings_))
 {
     color = format_settings.pretty.color == 1 || (format_settings.pretty.color == 2 && format_settings.is_writing_to_terminal);
 
@@ -90,7 +104,7 @@ void VerticalRowOutputFormat::writeValue(const IColumn & column, const ISerializ
         String serialized_value;
         {
             WriteBufferFromString buf(serialized_value);
-            serialization.serializeText(column, row_num, buf, format_settings);
+            serialization.serializeText(column, row_num, buf, text_format_settings);
         }
 
         /// Highlight groups of thousands.
@@ -105,7 +119,7 @@ void VerticalRowOutputFormat::writeValue(const IColumn & column, const ISerializ
     }
     else
     {
-        serialization.serializeText(column, row_num, out, format_settings);
+        serialization.serializeText(column, row_num, out, text_format_settings);
     }
 
     /// Write a tip.

@@ -1239,6 +1239,7 @@ ContextData::ContextData(const ContextData &o) :
     default_format(o.default_format),
     insert_format(o.insert_format),
     external_tables_mapping(o.external_tables_mapping),
+    query_result_temporary_tables(o.query_result_temporary_tables),
     scalars(o.scalars),
     special_scalars(o.special_scalars),
     next_task_callback(o.next_task_callback),
@@ -2484,6 +2485,7 @@ void Context::addExternalTable(const String & table_name, std::shared_ptr<Tempor
         throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS, "Temporary table {} already exists", backQuoteIfNeed(table_name));
 
     external_tables_mapping.emplace(table_name, std::move(temporary_table));
+    query_result_temporary_tables.erase(table_name);
 }
 
 void Context::updateExternalTable(const String & table_name, std::shared_ptr<TemporaryTableHolder> temporary_table)
@@ -2497,6 +2499,7 @@ void Context::updateExternalTable(const String & table_name, std::shared_ptr<Tem
         throw Exception(ErrorCodes::UNKNOWN_TABLE, "Temporary table {} doesn't exist", backQuoteIfNeed(table_name));
 
     it->second = std::move(temporary_table);
+    query_result_temporary_tables.erase(table_name);
 }
 
 void Context::addOrUpdateExternalTable(const String & table_name, std::shared_ptr<TemporaryTableHolder> temporary_table)
@@ -2508,6 +2511,7 @@ void Context::addOrUpdateExternalTable(const String & table_name, std::shared_pt
     auto [it, inserted] = external_tables_mapping.emplace(table_name, temporary_table);
     if (!inserted)
         it->second = std::move(temporary_table);
+    query_result_temporary_tables.erase(table_name);
 }
 
 std::shared_ptr<TemporaryTableHolder> Context::findExternalTable(const String & table_name) const
@@ -2539,8 +2543,36 @@ std::shared_ptr<TemporaryTableHolder> Context::removeExternalTable(const String 
             return {};
         holder = iter->second;
         external_tables_mapping.erase(iter);
+        query_result_temporary_tables.erase(table_name);
     }
     return holder;
+}
+
+bool Context::isQueryResultTemporaryTable(const String & table_name) const
+{
+    if (isGlobalContext())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Global context cannot have external tables");
+
+    std::lock_guard lock(mutex);
+    return query_result_temporary_tables.contains(table_name);
+}
+
+void Context::registerQueryResultTemporaryTable(const String & table_name)
+{
+    if (isGlobalContext())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Global context cannot have external tables");
+
+    std::lock_guard lock(mutex);
+    query_result_temporary_tables.emplace(table_name);
+}
+
+void Context::unregisterQueryResultTemporaryTable(const String & table_name)
+{
+    if (isGlobalContext())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Global context cannot have external tables");
+
+    std::lock_guard lock(mutex);
+    query_result_temporary_tables.erase(table_name);
 }
 
 

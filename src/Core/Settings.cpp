@@ -4395,6 +4395,26 @@ ENGINE = Log
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 )", 0) \
+    \
+    DECLARE(Bool, create_temporary_table_for_query_result, false, R"(
+Create a temporary table for every top-level `SELECT` query result in the current session. The table name is the `query_id`.
+)", 0) \
+    \
+    DECLARE(String, query_result_temporary_table_engine, "", R"(
+Storage engine expression for temporary tables created from query results. If empty, `default_temporary_table_engine` is used.
+)", 0) \
+    \
+    DECLARE(UInt64, query_result_temporary_table_max_rows, 0, R"(
+Maximum number of result rows to store in a temporary query result table. Zero means unlimited. If the query result exceeds the limit, the query still returns normally, and `query_result_temporary_table_overflow_mode` controls whether the temporary table is exposed.
+)", 0) \
+    \
+    DECLARE(UInt64, query_result_temporary_table_max_bytes, 0, R"(
+Maximum number of result bytes to store in a temporary query result table. Zero means unlimited. If the query result exceeds the limit, the query still returns normally, and `query_result_temporary_table_overflow_mode` controls whether the temporary table is exposed.
+)", 0) \
+    \
+    DECLARE(String, query_result_temporary_table_overflow_mode, "drop", R"(
+What to do when a temporary query result table exceeds `query_result_temporary_table_max_rows` or `query_result_temporary_table_max_bytes`. `drop` means the query result is returned to the client, but the temporary table is not exposed. `truncate` means the temporary table is exposed with rows written before the limit was exceeded.
+)", 0) \
     DECLARE(DefaultTableEngine, default_table_engine, DefaultTableEngine::MergeTree, R"(
 Default table engine to use when `ENGINE` is not set in a `CREATE` statement.
 

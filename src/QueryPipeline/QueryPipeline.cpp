@@ -11,6 +11,7 @@
 #include <Interpreters/Cache/QueryResultCache.h>
 #include <Interpreters/Context.h>
 #include <Processors/Formats/IOutputFormat.h>
+#include <Processors/ForkProcessor.h>
 #include <Processors/IProcessor.h>
 #include <Processors/ISource.h>
 #include <Processors/LimitTransform.h>
@@ -553,6 +554,96 @@ void QueryPipeline::complete(std::shared_ptr<IOutputFormat> format)
         addMaterializing(totals, *processors, remove_special_column_representations);
         addMaterializing(extremes, *processors, remove_special_column_representations);
     }
+
+    auto & format_main = format->getPort(IOutputFormat::PortKind::Main);
+    auto & format_totals = format->getPort(IOutputFormat::PortKind::Totals);
+    auto & format_extremes = format->getPort(IOutputFormat::PortKind::Extremes);
+
+    if (!totals)
+    {
+        auto source = std::make_shared<NullSource>(format_totals.getSharedHeader());
+        totals = &source->getPort();
+        processors->emplace_back(std::move(source));
+    }
+
+    if (!extremes)
+    {
+        auto source = std::make_shared<NullSource>(format_extremes.getSharedHeader());
+        extremes = &source->getPort();
+        processors->emplace_back(std::move(source));
+    }
+
+    connect(*output, format_main);
+    connect(*totals, format_totals);
+    connect(*extremes, format_extremes);
+
+    output = nullptr;
+    totals = nullptr;
+    extremes = nullptr;
+
+    initRowsBeforeLimit(format.get());
+    for (const auto & context : resources.interpreter_context)
+    {
+        if (context->getSettingsRef()[Setting::rows_before_aggregation])
+        {
+            initRowsBeforeAggregation(processors, format.get());
+            break;
+        }
+    }
+    output_format = format.get();
+
+    processors->emplace_back(std::move(format));
+}
+
+void QueryPipeline::addAdditionalSink(Chain additional_sink_chain)
+{
+    if (additional_sink_chain.empty())
+        return;
+
+    if (!pulling())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Pipeline must be pulling to add additional sink");
+
+    auto fork = std::make_shared<ForkProcessor>(output->getHeader(), 2);
+    auto * client_output = &fork->getOutputs().front();
+    auto * additional_output = &fork->getOutputs().back();
+    connect(*output, fork->getInputPort());
+    processors->emplace_back(std::move(fork));
+
+    resources = additional_sink_chain.detachResources();
+
+    for (auto processor : additional_sink_chain.getProcessors())
+        processors->emplace_back(std::move(processor));
+
+    auto additional_empty_sink = std::make_shared<EmptySink>(additional_sink_chain.getOutputPort().getSharedHeader());
+
+    connect(*additional_output, additional_sink_chain.getInputPort());
+    connect(additional_sink_chain.getOutputPort(), additional_empty_sink->getPort());
+
+    processors->emplace_back(std::move(additional_empty_sink));
+
+    output = client_output;
+}
+
+void QueryPipeline::complete(std::shared_ptr<IOutputFormat> format, Chain additional_sink_chain)
+{
+    if (additional_sink_chain.empty())
+    {
+        complete(std::move(format));
+        return;
+    }
+
+    if (!pulling())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Pipeline must be pulling to be completed with output format and additional sink");
+
+    if (format->expectMaterializedColumns())
+    {
+        bool remove_special_column_representations = !format->supportsSpecialSerializationKinds();
+        addMaterializing(output, *processors, remove_special_column_representations);
+        addMaterializing(totals, *processors, remove_special_column_representations);
+        addMaterializing(extremes, *processors, remove_special_column_representations);
+    }
+
+    addAdditionalSink(std::move(additional_sink_chain));
 
     auto & format_main = format->getPort(IOutputFormat::PortKind::Main);
     auto & format_totals = format->getPort(IOutputFormat::PortKind::Totals);

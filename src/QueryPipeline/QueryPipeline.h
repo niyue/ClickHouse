@@ -99,6 +99,8 @@ public:
     void complete(Pipe pipe);
     /// Only for pulling.
     void complete(std::shared_ptr<IOutputFormat> format);
+    void complete(std::shared_ptr<IOutputFormat> format, Chain additional_sink_chain);
+    void addAdditionalSink(Chain additional_sink_chain);
     void complete(Chain chain);
     void complete(std::shared_ptr<SinkToStorage> sink);
     void complete(std::shared_ptr<ISink> sink);

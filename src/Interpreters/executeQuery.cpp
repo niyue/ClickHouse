@@ -21,17 +21,21 @@
 
 #include <QueryPipeline/BlockIO.h>
 #include <Processors/Transforms/getSourceFromASTInsertQuery.h>
+#include <Processors/Transforms/QueryResultLimitTransform.h>
 #include <Processors/Formats/Impl/NullFormat.h>
+#include <Processors/Sinks/SinkToStorage.h>
 
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTInsertQuery.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTCreateQuery.h>
+#include <Parsers/ASTFunction.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTShowProcesslistQuery.h>
 #include <Parsers/ASTTransactionControl.h>
 #include <Parsers/ASTExplainQuery.h>
 #include <Parsers/parseQuery.h>
+#include <Parsers/ParserCreateQuery.h>
 #include <Parsers/ParserQuery.h>
 #include <Parsers/queryNormalization.h>
 #include <Parsers/toOneLineQuery.h>
@@ -43,6 +47,8 @@
 
 #include <Formats/FormatFactory.h>
 #include <Storages/StorageInput.h>
+#include <Storages/StorageFactory.h>
+#include <Storages/IStorage.h>
 
 #include <Access/ContextAccess.h>
 #include <Access/EnabledQuota.h>
@@ -85,15 +91,19 @@
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Processors/QueryPlan/RuntimeFilterLookup.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
+#include <QueryPipeline/Chain.h>
 
 #include <Common/QueryFuzzer.h>
+#include <Common/quoteString.h>
 #include <Common/randomSeed.h>
 
 #include <Poco/Net/SocketAddress.h>
 
 #include <exception>
+#include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 
 #include <boost/algorithm/string/predicate.hpp>
@@ -130,7 +140,9 @@ namespace Setting
     extern const SettingsFloat ast_fuzzer_runs;
     extern const SettingsBool async_insert;
     extern const SettingsBool calculate_text_stack_trace;
+    extern const SettingsBool create_temporary_table_for_query_result;
     extern const SettingsBool deduplicate_blocks_in_dependent_materialized_views;
+    extern const SettingsDefaultTableEngine default_temporary_table_engine;
     extern const SettingsDialect dialect;
     extern const SettingsOverflowMode distinct_overflow_mode;
     extern const SettingsBool enable_global_with_statement;
@@ -172,6 +184,10 @@ namespace Setting
     extern const SettingsBool query_cache_squash_partial_results;
     extern const SettingsQueryResultCacheSystemTableHandling query_cache_system_table_handling;
     extern const SettingsSeconds query_cache_ttl;
+    extern const SettingsString query_result_temporary_table_engine;
+    extern const SettingsUInt64 query_result_temporary_table_max_bytes;
+    extern const SettingsUInt64 query_result_temporary_table_max_rows;
+    extern const SettingsString query_result_temporary_table_overflow_mode;
     extern const SettingsInt64 query_metric_log_interval;
     extern const SettingsOverflowMode read_overflow_mode;
     extern const SettingsOverflowMode read_overflow_mode_leaf;
@@ -222,6 +238,7 @@ namespace ErrorCodes
     extern const int ABORTED;
     extern const int UNSUPPORTED_PARAMETER;
     extern const int FAULT_INJECTED;
+    extern const int TABLE_ALREADY_EXISTS;
 }
 
 namespace FailPoints
@@ -238,6 +255,163 @@ static void checkASTSizeLimits(const IAST & ast, const Settings & settings)
         ast.checkDepth(settings[Setting::max_ast_depth]);
     if (settings[Setting::max_ast_elements])
         ast.checkSize(settings[Setting::max_ast_elements]);
+}
+
+struct QueryResultTemporaryTable
+{
+    String name;
+    TemporaryTableHolderPtr holder;
+    std::shared_ptr<std::atomic_bool> exceeded = std::make_shared<std::atomic_bool>(false);
+    Chain chain;
+};
+
+static QueryResultLimitOverflowMode parseQueryResultTemporaryTableOverflowMode(const String & overflow_mode)
+{
+    if (overflow_mode == "drop")
+        return QueryResultLimitOverflowMode::Drop;
+    if (overflow_mode == "truncate")
+        return QueryResultLimitOverflowMode::Truncate;
+
+    throw Exception(
+        ErrorCodes::BAD_ARGUMENTS,
+        "Setting `query_result_temporary_table_overflow_mode` must be either `drop` or `truncate`");
+}
+
+static ASTPtr parseQueryResultTemporaryTableStorage(const Settings & settings)
+{
+    String engine_expression = settings[Setting::query_result_temporary_table_engine].value;
+
+    auto storage = make_intrusive<ASTStorage>();
+    if (engine_expression.empty())
+    {
+        auto engine_ast = make_intrusive<ASTFunction>();
+        engine_ast->name = SettingFieldDefaultTableEngine(settings[Setting::default_temporary_table_engine].value).toString();
+        engine_ast->setNoEmptyArgs(true);
+        storage->set(storage->engine, engine_ast);
+    }
+    else
+    {
+        if (!boost::algorithm::istarts_with(engine_expression, "ENGINE"))
+            engine_expression = "ENGINE = " + engine_expression;
+
+        ParserStorage parser(ParserStorage::TABLE_ENGINE);
+        const char * begin = engine_expression.data();
+        const char * end = begin + engine_expression.size();
+        storage = boost::static_pointer_cast<ASTStorage>(parseQuery(
+            parser,
+            begin,
+            end,
+            "query result temporary table engine",
+            0,
+            settings[Setting::max_parser_depth],
+            settings[Setting::max_parser_backtracks]));
+    }
+
+    if (!storage || !storage->engine)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid query result temporary table engine");
+
+    const auto & engine_name = storage->engine->name;
+    if (engine_name.starts_with("Replicated") || engine_name.starts_with("Shared") || engine_name == "KeeperMap")
+        throw Exception(ErrorCodes::INCORRECT_QUERY, "Temporary tables cannot be created with Replicated, Shared or KeeperMap table engines");
+
+    return storage;
+}
+
+static TemporaryTableHolderPtr createQueryResultTemporaryTable(
+    const String & table_name,
+    const Block & header,
+    ContextMutablePtr context)
+{
+    auto create = make_intrusive<ASTCreateQuery>();
+    create->setIsTemporary(true);
+    create->setTable(table_name);
+
+    auto columns_ast = make_intrusive<ASTColumns>();
+    columns_ast->set(columns_ast->columns, InterpreterCreateQuery::formatColumns(ColumnsDescription(header.getNamesAndTypesList())));
+    create->set(create->columns_list, columns_ast);
+    create->set(create->storage, parseQueryResultTemporaryTableStorage(context->getSettingsRef()));
+
+    ColumnsDescription columns(header.getNamesAndTypesList());
+    ConstraintsDescription constraints;
+    DatabasePtr database = DatabaseCatalog::instance().getDatabase(DatabaseCatalog::TEMPORARY_DATABASE);
+
+    auto creator = [create, context, database, columns, constraints](const StorageID & table_id)
+    {
+        return StorageFactory::instance().get(
+            *create,
+            database->getTableDataPath(table_id.getTableName()),
+            context,
+            context->getGlobalContext(),
+            columns,
+            constraints,
+            LoadingStrictnessLevel::CREATE,
+            /*is_restore_from_backup=*/ false);
+    };
+
+    return std::make_shared<TemporaryTableHolder>(context, creator, create);
+}
+
+static std::optional<QueryResultTemporaryTable> prepareQueryResultTemporaryTable(
+    const ASTPtr & ast,
+    ContextMutablePtr context,
+    const QueryPipeline & pipeline,
+    bool internal)
+{
+    const auto & settings = context->getSettingsRef();
+    if (internal || !settings[Setting::create_temporary_table_for_query_result] || !pipeline.pulling())
+        return std::nullopt;
+
+    if (!ast || !ast->as<ASTSelectWithUnionQuery>())
+        return std::nullopt;
+
+    const auto overflow_mode = parseQueryResultTemporaryTableOverflowMode(settings[Setting::query_result_temporary_table_overflow_mode].value);
+
+    auto context_handle = context->hasSessionContext() ? context->getSessionContext() : context;
+    const auto & table_name = context->getCurrentQueryId();
+    if (auto existing = context_handle->findExternalTable(table_name); existing && !context_handle->isQueryResultTemporaryTable(table_name))
+        throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS, "Temporary table {} already exists", backQuoteIfNeed(table_name));
+
+    QueryResultTemporaryTable result;
+    result.name = table_name;
+    result.holder = createQueryResultTemporaryTable(table_name, pipeline.getHeader(), context);
+
+    auto storage = result.holder->getTable();
+    auto metadata_snapshot = storage->getInMemoryMetadataPtr(context, false);
+    auto sink = storage->write({}, metadata_snapshot, context, /*async_insert=*/ false);
+
+    result.chain = Chain(std::make_shared<QueryResultLimitTransform>(
+        pipeline.getSharedHeader(),
+        settings[Setting::query_result_temporary_table_max_rows],
+        settings[Setting::query_result_temporary_table_max_bytes],
+        overflow_mode,
+        result.exceeded));
+    result.chain.addSink(std::move(sink));
+
+    return std::make_optional(std::move(result));
+}
+
+static void addQueryResultTemporaryTableFinishCallback(
+    BlockIO & streams,
+    ContextMutablePtr context,
+    const QueryResultTemporaryTable & query_result_temporary_table)
+{
+    auto context_handle = context->hasSessionContext() ? context->getSessionContext() : context;
+    auto table_name = query_result_temporary_table.name;
+    auto holder = query_result_temporary_table.holder;
+    auto exceeded = query_result_temporary_table.exceeded;
+    streams.finish_callbacks.push_back(
+        [context_handle, table_name, holder, exceeded](const QueryPipelineFinalizedInfo &, std::chrono::system_clock::time_point)
+        {
+            if (exceeded->load(std::memory_order_relaxed))
+            {
+                if (context_handle->isQueryResultTemporaryTable(table_name))
+                    context_handle->removeExternalTable(table_name);
+                return;
+            }
+
+            context_handle->addOrUpdateExternalTable(table_name, holder);
+            context_handle->registerQueryResultTemporaryTable(table_name);
+        });
 }
 
 
@@ -2205,6 +2379,13 @@ std::pair<ASTPtr, BlockIO> executeQuery(
             res.null_format = true;
     }
 
+    auto query_result_temporary_table = prepareQueryResultTemporaryTable(ast, context, res.pipeline, flags.internal);
+    if (query_result_temporary_table)
+    {
+        addQueryResultTemporaryTableFinishCallback(res, context, *query_result_temporary_table);
+        res.pipeline.addAdditionalSink(std::move(query_result_temporary_table->chain));
+    }
+
     /// The 'SYSTEM ENABLE FAILPOINT terminate_with_exception' query itself should succeed.
     if (ast && !ast->as<ASTSystemQuery>())
     {
@@ -2507,7 +2688,16 @@ void executeQuery(
             result_details.content_type = FormatFactory::instance().getContentType(format_name, output_format_settings);
             result_details.format = format_name;
 
-            pipeline.complete(output_format);
+            auto query_result_temporary_table = prepareQueryResultTemporaryTable(ast, context, pipeline, flags.internal);
+            if (query_result_temporary_table)
+            {
+                addQueryResultTemporaryTableFinishCallback(streams, context, *query_result_temporary_table);
+                pipeline.complete(output_format, std::move(query_result_temporary_table->chain));
+            }
+            else
+            {
+                pipeline.complete(output_format);
+            }
         }
         else
         {

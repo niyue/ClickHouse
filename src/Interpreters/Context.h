@@ -32,6 +32,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <unordered_set>
 
 
 namespace Poco::Net
@@ -397,6 +398,7 @@ protected:
     String insert_format; /// Format, used in insert query.
 
     TemporaryTablesMapping external_tables_mapping;
+    std::unordered_set<String> query_result_temporary_tables;
     /// Query scalars
     Scalars scalars;
     /// Used to store constant values which are different on each instance during distributed plan, such as _shard_num.
@@ -990,6 +992,9 @@ public:
     void addOrUpdateExternalTable(const String & table_name, std::shared_ptr<TemporaryTableHolder> temporary_table);
     std::shared_ptr<TemporaryTableHolder> findExternalTable(const String & table_name) const;
     std::shared_ptr<TemporaryTableHolder> removeExternalTable(const String & table_name);
+    bool isQueryResultTemporaryTable(const String & table_name) const;
+    void registerQueryResultTemporaryTable(const String & table_name);
+    void unregisterQueryResultTemporaryTable(const String & table_name);
 
     Scalars getScalars() const;
     Block getScalar(const String & name) const;

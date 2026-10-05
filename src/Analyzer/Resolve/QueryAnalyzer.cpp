@@ -3079,16 +3079,16 @@ ProjectionNames QueryAnalyzer::resolveMatcher(QueryTreeNodePtr & matcher_node, I
             }
             else if (auto * rename_transformer = transformer->as<RenameColumnTransformerNode>())
             {
+                /// `RENAME` is terminal: its output names belong to this matcher expansion,
+                /// while `node_to_projection_name` may be shared with other expressions.
                 if (rename_transformer->getRenameTransformerType() == RenameColumnTransformerType::LAMBDA)
                 {
                     result_projection_names.back() = evaluate_rename_lambda(*rename_transformer, column_name);
-                    node_to_projection_name[node] = result_projection_names.back();
                 }
                 else if (auto new_name = rename_transformer->findNewName(column_name))
                 {
                     rename_transformer_to_used_column_names[rename_transformer].insert(column_name);
                     result_projection_names.back() = *new_name;
-                    node_to_projection_name[node] = result_projection_names.back();
                 }
             }
 

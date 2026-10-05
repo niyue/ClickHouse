@@ -160,8 +160,10 @@ CREATE TABLE t_mod_def (event String, c UInt32 MATERIALIZED JSONExtractUInt(even
     ENGINE = MergeTree() ORDER BY tuple();
 ALTER TABLE t_mod_def MODIFY COLUMN c UInt64 CODEC(T64, LZ4),
                       MODIFY COLUMN c UInt64 COMMENT 'z';
-SELECT '10', type, default_kind, default_expression, compression_codec, comment FROM system.columns
+SELECT '10', type, default_kind, default_expression, comment, compression_codec FROM system.columns
     WHERE database = currentDatabase() AND table = 't_mod_def' AND name = 'c';
+INSERT INTO t_mod_def (event) VALUES ('{"x":42}');
+SELECT '10', c FROM t_mod_def;
 DROP TABLE t_mod_def;
 
 -- 11. An existing default that cannot be read as the new type is rejected. Removing that default in

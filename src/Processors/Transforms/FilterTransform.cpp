@@ -11,6 +11,7 @@
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/IDataType.h>
+#include <DataTypes/TypeTree.h>
 #include <Interpreters/Cache/QueryConditionCache.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
@@ -66,20 +67,9 @@ bool hasConstantColumn(const ActionsDAG::Node * node)
     return node->column != nullptr && isColumnConst(*node->column);
 }
 
-template <typename Predicate>
-bool containsType(const IDataType & type, Predicate predicate)
+bool containsType(const IDataType & type, const std::function<bool(const IDataType &)> & predicate)
 {
-    if (predicate(type))
-        return true;
-
-    bool result = false;
-    type.forEachChild([&](const IDataType & child)
-    {
-        if (!result && containsType(child, predicate))
-            result = true;
-    });
-
-    return result;
+    return anyInTypeTree(type, predicate);
 }
 
 bool containsFloat(const DataTypePtr & type)

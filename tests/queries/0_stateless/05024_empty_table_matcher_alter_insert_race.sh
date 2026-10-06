@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-parallel, no-replicated-database
+# Tags: no-parallel, no-fasttest, no-replicated-database
 # The test enables a server-wide failpoint and exercises the plain `MergeTree` insert barrier.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

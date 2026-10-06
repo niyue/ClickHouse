@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-parallel, no-replicated-database, no-shared-merge-tree
+# Tags: zookeeper, no-parallel, no-fasttest, no-replicated-database, no-shared-merge-tree
 # The test enables a server-wide failpoint and exercises the `ReplicatedMergeTree` insert barrier.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

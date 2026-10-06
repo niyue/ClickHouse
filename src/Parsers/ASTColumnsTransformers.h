@@ -142,6 +142,8 @@ public:
     }
     void appendColumnName(WriteBuffer & ostr) const override;
     void updateTreeHashImpl(SipHash & hash_state, bool ignore_aliases) const override;
+    void writeJSON(WriteBuffer & out) const override;
+    void readJSON(const Poco::JSON::Object & json) override;
 
     Names source_names;
     Names target_names;

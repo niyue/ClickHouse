@@ -241,9 +241,11 @@ ASTPtr makeStoredDefaultExpressionList(const ColumnsDescription & columns, const
         if (!column.default_desc.expression || excluded_columns.contains(column.name))
             continue;
 
+        /// The conversion holds its own copy of the default expression rather than referring to the
+        /// alias of the expression below, for the reason explained in `getDefaultExpressionInfoInto`.
         const auto tmp_column_name = column.name + "_tmp_alter" + toString(randomSeed());
         default_expr_list->children.emplace_back(setAlias(
-            addTypeConversionToAST(make_intrusive<ASTIdentifier>(tmp_column_name), column.type->getName()), column.name));
+            addTypeConversionToAST(column.default_desc.expression->clone(), column.type->getName()), column.name));
         default_expr_list->children.emplace_back(setAlias(column.default_desc.expression->clone(), tmp_column_name));
     }
 

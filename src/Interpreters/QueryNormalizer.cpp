@@ -251,6 +251,23 @@ void QueryNormalizer::visitChildren(IAST * node, Data & data)
                     extracted_aliases.insert(data.aliases.extract(it));
                 }
             }
+
+            /// Also hide dotted aliases rooted at a lambda parameter: inside `x -> x.id` the identifier
+            /// `x.id` is a field access of the parameter `x`, not a reference to an outer alias `x.id`.
+            for (auto it = data.aliases.begin(); it != data.aliases.end();)
+            {
+                const auto & alias_name = it->first;
+                auto dot_pos = alias_name.find('.');
+                if (dot_pos != String::npos
+                    && std::find(lambda_aliases.begin(), lambda_aliases.end(), alias_name.substr(0, dot_pos)) != lambda_aliases.end())
+                {
+                    auto next = std::next(it);
+                    extracted_aliases.insert(data.aliases.extract(it));
+                    it = next;
+                }
+                else
+                    ++it;
+            }
         }
 
         /// We skip the first argument. We also assume that the lambda function can not have parameters.

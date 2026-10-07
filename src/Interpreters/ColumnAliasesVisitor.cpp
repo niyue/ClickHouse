@@ -66,6 +66,11 @@ void ColumnAliasesMatcher::visit(ASTIdentifier & node, ASTPtr & ast, Data & data
             || data.private_aliases.contains(*column_name) || !data.columns.has(*column_name))
             return;
 
+        /// Inside `x -> x.id` the identifier `x.id` is a field access of the lambda parameter `x`,
+        /// not a reference to a table column named `x.id`.
+        if (node.compound() && data.private_aliases.contains(node.name_parts.front()))
+            return;
+
         const auto & col = data.columns.get(*column_name);
         if (col.default_desc.kind == ColumnDefaultKind::Alias)
         {

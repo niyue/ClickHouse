@@ -56,11 +56,18 @@ static void addDefaultExpressionInputsToRead(
         if (!hive_parameters.hive_partition_columns_to_read_from_file_path_map.contains(column.name))
             available_in_file.insert(column.name);
 
-    /// `columns_to_read` grows while it is walked, so a default that reads another defaulted
-    /// column pulls in the inputs of that one too.
-    for (size_t i = 0; i < columns_to_read.size(); ++i)
+    /// Walk the defaults transitively: a default that reads another defaulted column needs the
+    /// inputs of that one too, even when the intermediate column is itself missing from the file
+    /// (`AddingDefaultsTransform` then evaluates it from its own default). Only the columns that
+    /// exist in the file are appended to `columns_to_read`.
+    Strings names_to_visit(columns_to_read.begin(), columns_to_read.end());
+    NameSet visited(names_to_visit.begin(), names_to_visit.end());
+    while (!names_to_visit.empty())
     {
-        auto it = column_defaults.find(columns_to_read[i]);
+        const String current = std::move(names_to_visit.back());
+        names_to_visit.pop_back();
+
+        auto it = column_defaults.find(current);
         if (it == column_defaults.end() || it->second.kind != ColumnDefaultKind::Default)
             continue;
 
@@ -71,6 +78,9 @@ static void addDefaultExpressionInputsToRead(
 
             if (available_in_file.contains(name) && already_read.emplace(name).second)
                 columns_to_read.push_back(name);
+
+            if (visited.emplace(name).second)
+                names_to_visit.push_back(name);
         }
     }
 }

@@ -1074,7 +1074,7 @@ bool ColumnsDescription::hasExplicitDefaultCompressionCodec(const String & colum
     for (const auto & stage : codec_func->arguments->children)
     {
         const auto * identifier = stage->as<ASTIdentifier>();
-        if (identifier && identifier->name() == DEFAULT_CODEC_NAME)
+        if (identifier && equalsCaseInsensitive(identifier->name(), DEFAULT_CODEC_NAME))
             return true;
     }
 

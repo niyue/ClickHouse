@@ -1,5 +1,6 @@
 #include <Interpreters/IdentifierSemantic.h>
 #include <Interpreters/RenameColumnVisitor.h>
+#include <Parsers/ASTColumnsMatcher.h>
 #include <Parsers/ASTColumnsTransformers.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
@@ -8,6 +9,28 @@
 
 namespace DB
 {
+
+namespace
+{
+
+void renameIdentifier(ASTIdentifier & identifier, const RenameColumnData & data)
+{
+    // TODO(ilezhankin): make proper rename
+    std::optional<String> identifier_column_name = IdentifierSemantic::getColumnName(identifier);
+    if (identifier_column_name && identifier_column_name == data.column_name)
+        identifier.setShortName(data.rename_to);
+}
+
+/// Renames the column names a matcher keeps as identifier children, like `a` in `COLUMNS(a, b)` or
+/// in `* EXCEPT a`. They name table columns even inside a lambda whose argument shadows the column.
+void renameMatcherColumnNames(const ASTs & column_names, const RenameColumnData & data)
+{
+    for (const auto & column_name : column_names)
+        if (auto * identifier = column_name->as<ASTIdentifier>())
+            renameIdentifier(*identifier, data);
+}
+
+}
 
 bool RenameColumnMatcher::needChildVisit(const ASTPtr & node, const ASTPtr & /*child*/, const Data & data)
 {
@@ -29,26 +52,43 @@ void RenameColumnMatcher::visit(ASTPtr & ast, Data & data)
 {
     if (auto * identifier = ast->as<ASTIdentifier>())
     {
-        if (!data.rename_identifiers)
-            return;
-        // TODO(ilezhankin): make proper rename
-        std::optional<String> identifier_column_name = IdentifierSemantic::getColumnName(*identifier);
-        if (identifier_column_name && identifier_column_name == data.column_name)
-            identifier->setShortName(data.rename_to);
+        if (data.rename_identifiers)
+            renameIdentifier(*identifier, data);
         return;
     }
 
     if (isShadowingLambda(*ast, data))
     {
         /// The lambda argument is a local binding, so an identifier with the column's name inside the
-        /// lambda refers to the argument. But the raw column names kept by matcher transformers, like
-        /// `REPLACE (0 AS a)` in `arrayMap(a -> tuple(* REPLACE (0 AS a)), [1])`, still name table columns.
+        /// lambda refers to the argument. But the column names kept by matchers and their transformers, like
+        /// `REPLACE (0 AS a)` in `arrayMap(a -> tuple(* REPLACE (0 AS a)), [1])` or `EXCEPT a` in
+        /// `arrayMap(a -> tuple(* EXCEPT a), [1])`, still name table columns.
         RenameColumnData nested_data = data;
         nested_data.rename_identifiers = false;
         RenameColumnVisitor visitor(nested_data);
         for (auto & child : ast->children)
             visitor.visit(child);
         return;
+    }
+
+    /// Where identifiers are renamed anyway, the in-depth traversal reaches these on its own.
+    if (!data.rename_identifiers)
+    {
+        if (const auto * except = ast->as<ASTColumnsExceptTransformer>())
+        {
+            renameMatcherColumnNames(except->children, data);
+            return;
+        }
+        if (const auto * list_matcher = ast->as<ASTColumnsListMatcher>())
+        {
+            renameMatcherColumnNames(list_matcher->column_list->children, data);
+            return;
+        }
+        if (const auto * qualified_list_matcher = ast->as<ASTQualifiedColumnsListMatcher>())
+        {
+            renameMatcherColumnNames(qualified_list_matcher->column_list->children, data);
+            return;
+        }
     }
 
     if (auto * replacement = ast->as<ASTColumnsReplaceTransformer::Replacement>())

@@ -11,8 +11,8 @@ struct RenameColumnData
 {
     String column_name;
     String rename_to;
-    /// Off inside a lambda whose argument shadows `column_name`: only the raw column names kept by
-    /// matcher transformers are renamed there.
+    /// Off inside a lambda whose argument shadows `column_name`: only the column names kept by
+    /// matchers and their transformers are renamed there.
     bool rename_identifiers = true;
 };
 
@@ -23,7 +23,8 @@ struct RenameColumnData
 /// An `APPLY (x -> ...)` lambda hangs off `ASTColumnsApplyTransformer::lambda` rather than off
 /// `children`, so it is descended into explicitly. Lambda arguments are local bindings, not
 /// columns: inside a lambda whose argument shadows the renamed column, identifiers are left alone,
-/// but the transformer column names are still renamed.
+/// but the column names kept by matchers (`COLUMNS(a)`, `EXCEPT a`, `REPLACE (... AS a)`) are still
+/// renamed.
 struct RenameColumnMatcher
 {
     using Data = RenameColumnData;

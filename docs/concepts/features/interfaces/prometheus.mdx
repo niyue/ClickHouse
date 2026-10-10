@@ -145,6 +145,8 @@ CREATE TABLE prometheus.metrics ENGINE = TimeSeries
 SETTINGS prometheus_remote_write_dynamic_routing_enabled = 1;
 ```
 
+The setting requires the `TimeSeries` table to be of [version](/reference/engines/table-engines/integrations/time-series#schema-versioning) 8 or later, so a table created by an older server can't opt in and must be re-created.
+
 The authenticated user must have the `INSERT` privilege on the target table. The privilege is checked before the table is looked up, so a user without it gets `ACCESS_DENIED` regardless of whether the table exists or has opted in.
 
 Prometheus then writes to a table chosen by the URL:

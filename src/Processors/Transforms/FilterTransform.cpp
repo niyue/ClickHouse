@@ -454,7 +454,7 @@ IProcessor::Status FilterTransform::prepare()
 
     auto status = ISimpleTransform::prepare();
 
-    if (status == IProcessor::Status::Finished)
+    if (status == IProcessor::Status::Finished && !isCancelled())
         writeIntoQueryConditionCache({});
 
     return status;
@@ -492,6 +492,20 @@ void FilterTransform::applyConstantColumnsAfterFilter(Columns & columns, size_t 
         /// is invisible to `IColumn::isSparse`, so `IExecutableFunction::executeWithoutSparseColumns` and
         /// `Aggregator` do not materialize it and then read the raw data of a column that is not there.
         columns[position] = ColumnConst::create(ColumnPtr(std::move(value))->convertToFullIfWrapped(), num_rows);
+    }
+}
+
+void FilterTransform::onCancel() noexcept
+{
+    ISimpleTransform::onCancel();
+    if (expression)
+    {
+        const auto & nodes = expression->getNodes();
+        for (const auto & node : nodes)
+        {
+            if (node.type == ActionsDAG::ActionType::FUNCTION && node.function)
+                node.function->cancelExecution();
+        }
     }
 }
 
@@ -557,8 +571,20 @@ void FilterTransform::doTransform(Chunk & chunk)
         Block block = getInputPort().getHeader().cloneWithColumns(columns);
         columns.clear();
 
+        if (isCancelled())
+        {
+            stopReading();
+            return;
+        }
+
         if (expression)
-            expression->execute(block, num_rows_before_filtration);
+            expression->execute(block, num_rows_before_filtration, false, false, &getCancellationFlag());
+
+        if (isCancelled())
+        {
+            stopReading();
+            return;
+        }
 
         columns = block.getColumns();
         types = block.getDataTypes();
@@ -697,7 +723,7 @@ void FilterTransform::doTransform(Chunk & chunk)
 
 void FilterTransform::writeIntoQueryConditionCache(const MarkRangesInfoPtr & mark_ranges_info)
 {
-    if (!query_condition_cache)
+    if (!query_condition_cache || isCancelled())
         return;
 
     /// A transform between the reading step and this filter (e.g. `FilterSortedStreamByRange`
